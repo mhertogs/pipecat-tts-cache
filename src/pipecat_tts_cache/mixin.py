@@ -6,6 +6,7 @@
 
 """TTS caching mixin for reducing API costs on repeated phrases."""
 
+import asyncio
 import inspect
 import re
 from dataclasses import dataclass
@@ -68,6 +69,7 @@ class TTSCacheMixin:
 
         self._cache_hits = 0
         self._cache_misses = 0
+        self._tts_sentence_done: Optional[asyncio.Event] = None
         self._batch_cache_tasks: List[BatchCacheTask] = []
         self._batch_audio_buffer: List[CachedAudioChunk] = []
         self._batch_word_timestamps: List[Tuple[str, float]] = []
@@ -136,6 +138,8 @@ class TTSCacheMixin:
         )
         self._batch_cache_tasks.append(task)
 
+        self._tts_sentence_done = asyncio.Event()
+
         try:
             async for frame in super().run_tts(text):
                 yield frame
@@ -143,6 +147,16 @@ class TTSCacheMixin:
             logger.error(f"TTS generation failed: {e}")
             self._clear_batch_state()
             raise
+
+        # Wait for TTSStoppedFrame to be pushed through push_frame().
+        # For HTTP TTS: event is already set (frames yielded inline). No-op wait.
+        # For websocket TTS: blocks until background task delivers all audio.
+        try:
+            await asyncio.wait_for(self._tts_sentence_done.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"Timed out waiting for TTS completion: '{text[:50]}...'")
+        finally:
+            self._tts_sentence_done = None
 
     async def _safe_cache_get(self, key: str) -> Optional[CachedTTSResponse]:
         """Get from cache with error handling."""
@@ -204,6 +218,8 @@ class TTSCacheMixin:
 
             elif isinstance(frame, TTSStoppedFrame):
                 await self._finalize_batch_cache_tasks()
+                if self._tts_sentence_done is not None:
+                    self._tts_sentence_done.set()
 
         await super().push_frame(frame, direction)
 
@@ -391,6 +407,10 @@ class TTSCacheMixin:
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         """Handle interruptions during TTS generation."""
+        if self._tts_sentence_done is not None:
+            self._tts_sentence_done.set()
+            self._tts_sentence_done = None
+
         if self._batch_cache_tasks:
             logger.debug(
                 f"Interruption - clearing {len(self._batch_cache_tasks)} pending cache tasks"
